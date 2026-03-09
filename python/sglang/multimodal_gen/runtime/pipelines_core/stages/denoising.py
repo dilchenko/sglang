@@ -364,6 +364,60 @@ class DenoisingStage(PipelineStage):
         else:
             return None
 
+    def _should_enable_piecewise_cuda_graph(
+        self, batch: Req, server_args: ServerArgs
+    ) -> bool:
+        if not getattr(server_args, "enable_piecewise_cuda_graph", False):
+            return False
+        if batch.is_warmup:
+            return False
+        if not current_platform.is_cuda_alike():
+            self.log_info(
+                "[Diffusion-PCG] Disabled: current platform is not CUDA-like (%s)",
+                current_platform.device_type,
+            )
+            return False
+        if not server_args.pipeline_config.task_type.is_image_gen():
+            self.log_info(
+                "[Diffusion-PCG] Disabled: task_type=%s is not image generation",
+                server_args.pipeline_config.task_type,
+            )
+            return False
+        if get_world_size() != 1:
+            self.log_info(
+                "[Diffusion-PCG] Disabled: currently only supports single-rank. world_size=%d",
+                get_world_size(),
+            )
+            return False
+        if self.attn_backend.get_enum() != AttentionBackendEnum.FA:
+            self.log_info(
+                "[Diffusion-PCG] Disabled: currently only supports FA backend. backend=%s",
+                self.attn_backend.get_enum(),
+            )
+            return False
+        return True
+
+    def _maybe_enable_piecewise_cuda_graph(
+        self, batch: Req, server_args: ServerArgs
+    ) -> None:
+        if not self._should_enable_piecewise_cuda_graph(batch, server_args):
+            return
+
+        enabled_models: list[str] = []
+        pcg_txt_len_buckets = tuple(server_args.diffusion_pcg_txt_len_buckets)
+        for model in filter(None, [self.transformer, self.transformer_2]):
+            enable_func = getattr(model, "enable_piecewise_cuda_graph", None)
+            if callable(enable_func):
+                enable_func(txt_len_buckets=pcg_txt_len_buckets)
+                enabled_models.append(model.__class__.__name__)
+
+        if enabled_models:
+            self.log_info(
+                "[Diffusion-PCG] Enabled model-specific piecewise CUDA graph for models=%s txt_len_buckets=%s",
+                enabled_models,
+                pcg_txt_len_buckets,
+            )
+
     @property
     def parallelism_type(self) -> StageParallelismType:
         # return StageParallelismType.CFG_PARALLEL if get_global_server_args().enable_cfg_parallel else StageParallelismType.REPLICATED
@@ -543,6 +597,8 @@ class DenoisingStage(PipelineStage):
             server_args.model_loaded["transformer"] = True
         else:
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
+
+        self._maybe_enable_piecewise_cuda_graph(batch, server_args)
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(

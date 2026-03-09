@@ -44,6 +44,11 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.piecewise_cuda_graph import (
+    PiecewiseCudaGraphRunner,
+    get_padded_length,
+    pad_tensor_to_length,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -777,6 +782,127 @@ class QwenImageTransformerBlock(nn.Module):
             self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
             self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
 
+        self._enable_piecewise_cuda_graph = False
+        self._piecewise_cuda_graph_runner = None
+        self._txt_len_buckets = (64, 128, 256, 512, 1024, 2048, 4096)
+
+    def enable_piecewise_cuda_graph(
+        self, txt_len_buckets: tuple[int, ...] | None = None
+    ) -> None:
+        self._enable_piecewise_cuda_graph = True
+        if txt_len_buckets:
+            self._txt_len_buckets = tuple(sorted(set(txt_len_buckets)))
+        if self._piecewise_cuda_graph_runner is None:
+            self._piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner()
+
+    def _get_text_bucket_len(self, text_len: int) -> int:
+        return get_padded_length(text_len, self._txt_len_buckets)
+
+    def _pad_text_states(self, tensor: torch.Tensor, bucket_len: int) -> torch.Tensor:
+        return pad_tensor_to_length(tensor, bucket_len, dim=1)
+
+    def _pad_text_mask(
+        self, tensor: torch.Tensor | None, bucket_len: int
+    ) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        return pad_tensor_to_length(tensor, bucket_len, dim=1)
+
+    def _reshape_mod_params_for_quant(self, mod_params: torch.Tensor) -> torch.Tensor:
+        if (
+            self.quant_config is not None
+            and hasattr(self.quant_config, "get_name")
+            and self.quant_config.get_name() == "svdquant"
+        ):
+            return (
+                mod_params.view(mod_params.shape[0], -1, 6)
+                .transpose(1, 2)
+                .reshape(mod_params.shape[0], -1)
+            )
+        return mod_params
+
+    def _forward_pre_attn_graphable(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb_img_silu: torch.Tensor,
+        temb_txt_silu: torch.Tensor,
+        modulate_index: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        img_mod_params = self._reshape_mod_params_for_quant(
+            self.img_mod[1](temb_img_silu)
+        )
+        txt_mod_params = self._reshape_mod_params_for_quant(
+            self.txt_mod[1](temb_txt_silu)
+        )
+        img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
+        txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
+        img_modulated, img_gate1 = self._modulate(
+            hidden_states, img_mod1, self.img_norm1, modulate_index
+        )
+        txt_shift1, txt_scale1, txt_gate1_raw = txt_mod1.chunk(3, dim=-1)
+        txt_modulated = self.txt_norm1(
+            encoder_hidden_states, shift=txt_shift1, scale=txt_scale1
+        )
+        txt_gate1 = txt_gate1_raw.unsqueeze(1)
+        return img_modulated, img_gate1, img_mod2, txt_modulated, txt_gate1, txt_mod2
+
+    def _forward_post_attn_graphable(
+        self,
+        img_attn_output: torch.Tensor,
+        img_mod2: torch.Tensor,
+        hidden_states: torch.Tensor,
+        img_gate1: torch.Tensor,
+        txt_attn_output: torch.Tensor,
+        txt_mod2: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        txt_gate1: torch.Tensor,
+        modulate_index: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        img_modulated2, hidden_states, img_gate2 = self._modulate(
+            img_attn_output,
+            img_mod2,
+            self.img_norm2,
+            modulate_index,
+            gate_x=img_gate1,
+            residual_x=hidden_states,
+        )
+        img_mlp_output = self.img_mlp(img_modulated2)
+
+        if img_mlp_output.dim() == 2:
+            img_mlp_output = img_mlp_output.unsqueeze(0)
+        hidden_states = self.fuse_mul_add(img_mlp_output, img_gate2, hidden_states)
+
+        txt_shift2, txt_scale2, txt_gate2_raw = txt_mod2.chunk(3, dim=-1)
+        txt_modulated2, encoder_hidden_states = self.txt_norm2(
+            residual=encoder_hidden_states,
+            x=txt_attn_output,
+            gate=txt_gate1,
+            shift=txt_shift2,
+            scale=txt_scale2,
+        )
+        txt_gate2 = txt_gate2_raw.unsqueeze(1)
+        txt_mlp_output = self.txt_mlp(txt_modulated2)
+
+        if txt_mlp_output.dim() == 2:
+            txt_mlp_output = txt_mlp_output.unsqueeze(0)
+        encoder_hidden_states = self.fuse_mul_add(
+            txt_mlp_output, txt_gate2, encoder_hidden_states
+        )
+
+        if encoder_hidden_states.dtype == torch.float16:
+            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+        if hidden_states.dtype == torch.float16:
+            hidden_states = hidden_states.clip(-65504, 65504)
+        return encoder_hidden_states, hidden_states
+
     def _modulate(
         self,
         x: torch.Tensor,
@@ -869,6 +995,81 @@ class QwenImageTransformerBlock(nn.Module):
                 modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
                 return modulated, gate_result
 
+    def _forward_piecewise_cuda_graph(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor,
+        temb_img_silu: torch.Tensor,
+        temb_txt_silu: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        modulate_index: Optional[List[int]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert self._piecewise_cuda_graph_runner is not None
+
+        text_len = encoder_hidden_states.shape[1]
+        bucket_len = self._get_text_bucket_len(text_len)
+        padded_encoder_hidden_states = self._pad_text_states(
+            encoder_hidden_states, bucket_len
+        )
+        padded_encoder_hidden_states_mask = self._pad_text_mask(
+            encoder_hidden_states_mask, bucket_len
+        )
+
+        (
+            img_modulated,
+            img_gate1,
+            img_mod2,
+            txt_modulated,
+            txt_gate1,
+            txt_mod2,
+        ) = self._piecewise_cuda_graph_runner.replay_or_capture(
+            "qwen_image_pre_attn",
+            self._forward_pre_attn_graphable,
+            hidden_states,
+            padded_encoder_hidden_states,
+            temb_img_silu,
+            temb_txt_silu,
+            modulate_index,
+        )
+
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        rotary_emb = image_rotary_emb
+        if image_rotary_emb is not None:
+            img_cache, txt_cache = image_rotary_emb
+            rotary_emb = (img_cache, txt_cache[:text_len])
+
+        img_attn_output, txt_attn_output = self.attn(
+            hidden_states=img_modulated,
+            encoder_hidden_states=txt_modulated[:, :text_len, :],
+            encoder_hidden_states_mask=(
+                padded_encoder_hidden_states_mask[:, :text_len]
+                if padded_encoder_hidden_states_mask is not None
+                else None
+            ),
+            image_rotary_emb=rotary_emb,
+            **joint_attention_kwargs,
+        )
+
+        padded_txt_attn_output = self._pad_text_states(txt_attn_output, bucket_len)
+        padded_encoder_hidden_states, hidden_states = (
+            self._piecewise_cuda_graph_runner.replay_or_capture(
+                "qwen_image_post_attn",
+                self._forward_post_attn_graphable,
+                img_attn_output,
+                img_mod2,
+                hidden_states,
+                img_gate1,
+                padded_txt_attn_output,
+                txt_mod2,
+                padded_encoder_hidden_states,
+                txt_gate1,
+                modulate_index,
+            )
+        )
+        return padded_encoder_hidden_states[:, :text_len, :], hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -880,6 +1081,21 @@ class QwenImageTransformerBlock(nn.Module):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         modulate_index: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self._enable_piecewise_cuda_graph
+            and self._piecewise_cuda_graph_runner is not None
+        ):
+            return self._forward_piecewise_cuda_graph(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                temb_img_silu=temb_img_silu,
+                temb_txt_silu=temb_txt_silu,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+                modulate_index=modulate_index,
+            )
+
         # Get modulation parameters for both streams
         img_mod_params = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
         txt_mod_params = self.txt_mod[1](temb_txt_silu)  # [B, 6*dim]
@@ -1091,6 +1307,13 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         self.layer_names = ["transformer_blocks"]
+
+    def enable_piecewise_cuda_graph(
+        self, txt_len_buckets: tuple[int, ...] | None = None
+    ) -> None:
+        for block in self.transformer_blocks:
+            if hasattr(block, "enable_piecewise_cuda_graph"):
+                block.enable_piecewise_cuda_graph(txt_len_buckets=txt_len_buckets)
 
     @functools.lru_cache(maxsize=50)
     def build_modulate_index(self, img_shapes: tuple[int, int, int], device):
