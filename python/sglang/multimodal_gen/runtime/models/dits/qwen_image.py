@@ -784,7 +784,23 @@ class QwenImageTransformerBlock(nn.Module):
 
         self._enable_piecewise_cuda_graph = False
         self._piecewise_cuda_graph_runner = None
-        self._txt_len_buckets = (64, 128, 256, 512, 1024, 2048, 4096)
+        self._txt_len_buckets = (
+            64,
+            96,
+            128,
+            160,
+            192,
+            224,
+            256,
+            320,
+            384,
+            448,
+            512,
+            768,
+            1024,
+            1536,
+            2048,
+        )
 
     def enable_piecewise_cuda_graph(
         self, txt_len_buckets: tuple[int, ...] | None = None

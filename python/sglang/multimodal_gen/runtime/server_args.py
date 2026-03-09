@@ -48,7 +48,23 @@ from sglang.multimodal_gen.utils import (
 
 logger = init_logger(__name__)
 
-DIFFUSION_PCG_DEFAULT_TXT_LEN_BUCKETS = [64, 128, 256, 512, 1024, 2048, 4096]
+DIFFUSION_PCG_DEFAULT_TXT_LEN_BUCKETS = [
+    64,
+    96,
+    128,
+    160,
+    192,
+    224,
+    256,
+    320,
+    384,
+    448,
+    512,
+    768,
+    1024,
+    1536,
+    2048,
+]
 
 
 def _is_torch_tensor(obj: Any) -> tuple[bool, Any]:
@@ -778,7 +794,7 @@ class ServerArgs:
             type=int,
             nargs="+",
             default=DIFFUSION_PCG_DEFAULT_TXT_LEN_BUCKETS,
-            help="Text length buckets used by diffusion piecewise CUDA graph padding, e.g. --diffusion-pcg-txt-len-buckets 64 128 256 512 1024 2048 4096",
+            help="Text length buckets used by diffusion piecewise CUDA graph padding, e.g. --diffusion-pcg-txt-len-buckets 64 96 128 160 192 224 256 320 384 448 512 768 1024 1536 2048",
         )
 
         # warmup
