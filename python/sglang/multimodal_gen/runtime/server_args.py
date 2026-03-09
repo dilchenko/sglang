@@ -48,6 +48,7 @@ from sglang.multimodal_gen.utils import (
 
 logger = init_logger(__name__)
 
+DIFFUSION_PCG_DEFAULT_TXT_LEN_BUCKETS = [64, 128, 256, 512, 1024, 2048, 4096]
 
 def _is_torch_tensor(obj: Any) -> tuple[bool, Any]:
     """Return (is_tensor, torch_module_or_None) without importing torch at module import time."""
@@ -273,7 +274,7 @@ class ServerArgs:
     enable_torch_compile: bool = False
     enable_piecewise_cuda_graph: bool = False
     diffusion_pcg_txt_len_buckets: list[int] = field(
-        default_factory=lambda: [64, 128, 256, 512, 1024, 2048, 4096]
+        default_factory=lambda: list(DIFFUSION_PCG_DEFAULT_TXT_LEN_BUCKETS)
     )
 
     # warmup
@@ -775,7 +776,7 @@ class ServerArgs:
             "--diffusion-pcg-txt-len-buckets",
             type=int,
             nargs="+",
-            default=ServerArgs.diffusion_pcg_txt_len_buckets,
+            default=DIFFUSION_PCG_DEFAULT_TXT_LEN_BUCKETS,
             help="Text length buckets used by diffusion piecewise CUDA graph padding, e.g. --diffusion-pcg-txt-len-buckets 64 128 256 512 1024 2048 4096",
         )
 
