@@ -76,7 +76,10 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    StageProfiler,
+    get_diffusion_timing_exclusion_total,
+)
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
 
@@ -1052,6 +1055,7 @@ class DenoisingStage(PipelineStage):
 
         # Run denoising loop
         denoising_start_time = time.time()
+        denoising_exclusion_start_time = get_diffusion_timing_exclusion_total()
 
         # to avoid device-sync caused by timestep comparison
         is_warmup = batch.is_warmup
@@ -1167,9 +1171,17 @@ class DenoisingStage(PipelineStage):
         denoising_end_time = time.time()
 
         if num_timesteps > 0 and not is_warmup:
+            denoising_execution_time = denoising_end_time - denoising_start_time
+            denoising_excluded_time = (
+                get_diffusion_timing_exclusion_total() - denoising_exclusion_start_time
+            )
+            if denoising_excluded_time > 0:
+                denoising_execution_time = max(
+                    0.0, denoising_execution_time - denoising_excluded_time
+                )
             self.log_info(
                 "average time per step: %.4f seconds",
-                (denoising_end_time - denoising_start_time) / len(timesteps),
+                denoising_execution_time / len(timesteps),
             )
 
         self._post_denoising_loop(

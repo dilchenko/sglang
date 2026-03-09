@@ -50,6 +50,7 @@ logger = init_logger(__name__)
 
 DIFFUSION_PCG_DEFAULT_TXT_LEN_BUCKETS = [64, 128, 256, 512, 1024, 2048, 4096]
 
+
 def _is_torch_tensor(obj: Any) -> tuple[bool, Any]:
     """Return (is_tensor, torch_module_or_None) without importing torch at module import time."""
     try:

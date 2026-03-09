@@ -1,7 +1,12 @@
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    record_diffusion_timing_exclusion,
+)
 
 
 @dataclass
@@ -82,6 +87,7 @@ class PiecewiseCudaGraphRunner:
         key = self._build_key(phase, *inputs)
         entry = self._entries.get(key)
         if entry is None:
+            capture_start_time = time.perf_counter()
             static_inputs = tuple(self._clone_structure(item) for item in inputs)
             _ = fn(*static_inputs)
             graph = torch.cuda.CUDAGraph()
@@ -93,6 +99,7 @@ class PiecewiseCudaGraphRunner:
                 output=output,
             )
             self._entries[key] = entry
+            record_diffusion_timing_exclusion(time.perf_counter() - capture_start_time)
             return output
 
         for src, dst in zip(inputs, entry.static_inputs, strict=True):

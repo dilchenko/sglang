@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+from contextvars import ContextVar
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -26,6 +27,19 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 )
 
 logger = init_logger(__name__)
+_DIFFUSION_TIMING_EXCLUSION_S: ContextVar[float] = ContextVar(
+    "diffusion_timing_exclusion_s", default=0.0
+)
+
+
+def record_diffusion_timing_exclusion(duration_s: float) -> None:
+    if duration_s <= 0:
+        return
+    _DIFFUSION_TIMING_EXCLUSION_S.set(_DIFFUSION_TIMING_EXCLUSION_S.get() + duration_s)
+
+
+def get_diffusion_timing_exclusion_total() -> float:
+    return _DIFFUSION_TIMING_EXCLUSION_S.get()
 
 
 @dataclasses.dataclass
@@ -200,6 +214,7 @@ class StageProfiler:
         self.log_timing = perf_dump_path_provided or envs.SGLANG_DIFFUSION_STAGE_LOGGING
         self.log_stage_start_end = log_stage_start_end
         self.capture_memory = capture_memory
+        self.exclusion_start_s = 0.0
 
     def __enter__(self):
         if self.log_stage_start_end:
@@ -215,6 +230,7 @@ class StageProfiler:
                 and torch.get_device_module().is_available()
             ):
                 torch.get_device_module().synchronize()
+            self.exclusion_start_s = get_diffusion_timing_exclusion_total()
             self.start_time = time.perf_counter()
 
         return self
@@ -230,6 +246,11 @@ class StageProfiler:
         ):
             torch.get_device_module().synchronize()
         execution_time_s = time.perf_counter() - self.start_time
+        excluded_time_s = (
+            get_diffusion_timing_exclusion_total() - self.exclusion_start_s
+        )
+        if excluded_time_s > 0:
+            execution_time_s = max(0.0, execution_time_s - excluded_time_s)
 
         if exc_type:
             self.logger.error(
