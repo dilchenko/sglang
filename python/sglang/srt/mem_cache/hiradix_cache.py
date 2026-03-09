@@ -984,9 +984,22 @@ class HiRadixCache(RadixCache):
 
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
-            assert v == x, f"parent does not have child key, {key}"
-            if x in self.evictable_host_leaves:
-                self.evictable_host_leaves.remove(x)
+            if v is not x:
+                # When evict() -> write_backup() -> evict_host() is called
+                # recursively, a prior evict_host() call in the same chain may
+                # have already removed this node's parent or orphaned this node
+                # from the tree.  Host memory was already freed above, so skip
+                # the tree-cleanup step to avoid a crash.
+                if v is not None:
+                    # Another node occupies this key -- put it back.
+                    x.parent.children[key] = v
+                logger.warning(
+                    "evict_host: node already orphaned (key=%s), skipping tree cleanup",
+                    key,
+                )
+                self.evictable_host_leaves.discard(x)
+                continue
+            self.evictable_host_leaves.discard(x)
             self._update_host_leaf_status(x.parent)
 
             if len(x.parent.children) == 0 and x.parent.evicted:
